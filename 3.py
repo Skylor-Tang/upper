@@ -93,7 +93,7 @@ class MongoDBCacheBackend(BaseCache):
     def get_many(self, keys, version=None):
         self._delete_expired()  # 清理过期数据
         key_dict = {key: self.make_key(key, version) for key in keys}
-        results = self._collection.find({"_id": {"$in": list(key_dict.values())}})
+        results = self._collection.find({"_id": {"$in": list(key_dict.values())}})  # 过滤字段添加索引
 
         values = {}
         for result in results:
@@ -101,6 +101,47 @@ class MongoDBCacheBackend(BaseCache):
                 values[result["_id"]] = pickle.loads(result["value"])  # 使用 pickle 反序列化
 
         # 返回键值对
+        return {key: values.get(key_dict[key]) for key in keys}
+
+    def get_many(self, keys, version=None):
+        self._delete_expired()  # 清理过期数据
+
+        # 生成要查找的键的 ID
+        key_dict = {key: self.make_key(key, version) for key in keys}
+
+        # 使用聚合框架进行查询和处理
+        pipeline = [
+            {
+                "$match": {
+                    "_id": {"$in": list(key_dict.values())}  # 匹配所有需要的键
+                }
+            },
+            {
+                "$match": {
+                    "$or": [  # 过滤过期项
+                        {"expires_at": None},
+                        {"expires_at": {"$gt": datetime.utcnow()}}
+                    ]
+                }
+            },
+            {
+                "$project": {
+                    "key": "$_id",
+                    "value": {"$cond": {
+                        "if": {"$gte": ["$expires_at", datetime.utcnow()]},
+                        "then": "$value",
+                        "else": None
+                    }}
+                }
+            }
+        ]
+
+        results = self.collection.aggregate(pipeline)
+
+        # 将结果组装成最终字典
+        values = {result["key"]: pickle.loads(result["value"]) for result in results if result["value"] is not None}
+
+        # 返回最终结果
         return {key: values.get(key_dict[key]) for key in keys}
 
     def delete(self, key, version=None):
@@ -111,3 +152,35 @@ class MongoDBCacheBackend(BaseCache):
 
     def _delete_expired(self):
         self.collection.delete_many({"expires_at": {"$lte": datetime.utcnow()}})
+
+
+
+##### 分块聚合
+
+def get_many(self, keys, version=None):
+    self._delete_expired()  # 清理过期数据
+
+    # 构建正则表达式以批量获取相关的分块
+    key_patterns = [f"^{key}_chunk_" for key in keys]
+    regex_pattern = "|".join(key_patterns)
+    
+    # 执行批量查询
+    results = self.collection.find({"_id": {"$regex": regex_pattern}})
+
+    # 将结果按键分类
+    chunk_map = {}
+    for result in results:
+        key_prefix = result["_id"].split("_chunk_")[0]
+        if key_prefix not in chunk_map:
+            chunk_map[key_prefix] = []
+        chunk_map[key_prefix].append(result['value'])
+
+    # 合并分块并构建最终结果
+    values = {}
+    for key in keys:
+        if key in chunk_map:
+            values[key] = b''.join(chunk_map[key])  # 合并分块
+        else:
+            values[key] = None  # 如果没有找到对应的分块
+
+    return values
